@@ -9,6 +9,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections
 import re
 import os
 import sys
@@ -20,6 +21,10 @@ import traceback
 import codecs
 
 # point to absolute path of peda.py
+import triton
+
+import struct
+
 PEDAFILE = os.path.abspath(os.path.expanduser(__file__))
 if os.path.islink(PEDAFILE):
     PEDAFILE = os.readlink(PEDAFILE)
@@ -1315,7 +1320,7 @@ class PEDA(object):
 
         return None
 
-    def take_snapshot(self):
+    def take_snapshot(self, isSym):
         """
         Take a snapshot of current process
         Warning: this is not thread safe, do not use with multithread program
@@ -1338,10 +1343,13 @@ class PEDA(object):
         for (start, end, perm, _) in maps:
             if "w" in perm:
                 snapshot["mem"][start] = self.dumpmem(start, end)
+        # get trida object
+        if isSym and trida != None:
+            snapshot["trida-has-taken"] = trida.has_taken
 
         return snapshot
 
-    def save_snapshot(self, filename=None):
+    def save_snapshot(self, filename=None, isSym=False):
         """
         Save a snapshot of current process to file
         Warning: this is not thread safe, do not use with multithread program
@@ -1355,7 +1363,7 @@ class PEDA(object):
         if not filename:
             filename = self.get_config_filename("snapshot")
 
-        snapshot = self.take_snapshot()
+        snapshot = self.take_snapshot(isSym)
         if not snapshot:
             return False
         # dump to file
@@ -1365,7 +1373,7 @@ class PEDA(object):
 
         return True
 
-    def give_snapshot(self, snapshot):
+    def give_snapshot(self, snapshot, isSym):
         """
         Restore a saved snapshot of current process
         Warning: this is not thread safe, do not use with multithread program
@@ -1387,9 +1395,14 @@ class PEDA(object):
                 sp = v
         self.execute("set $sp = 0x%x" % sp)
 
+        # restore trida object
+        if isSym:
+            global trida
+            trida.has_taken = snapshot.get("trida-has-taken", None)
+
         return True
 
-    def restore_snapshot(self, filename=None):
+    def restore_snapshot(self, filename=None, isSym=False):
         """
         Restore a saved snapshot of current process from file
         Warning: this is not thread safe, do not use with multithread program
@@ -1405,7 +1418,7 @@ class PEDA(object):
 
         fd = open(filename, "rb")
         snapshot = pickle.load(fd)
-        return self.give_snapshot(snapshot)
+        return self.give_snapshot(snapshot, isSym)
 
 
     #########################
@@ -1709,6 +1722,9 @@ class PEDA(object):
                 mem += "".join([chr(int(c, 0)) for c in bytes])
 
         return mem
+
+    def read_mem(self, address, size):
+        return self.readmem(address, size)
 
     def read_int(self, address, intsize=None):
         """
@@ -3034,8 +3050,25 @@ class PEDA(object):
         return text
 
 
+    @memoized
+    def get_local_func(self):
+        loc_func = os.popen('nm --format="posix" %s 2> /dev/null | grep " T " | cut -f 1 -d " "' % self.getfile()).read()
+        loc_func = [x.strip() for x in loc_func.strip().split('\n')]
+        return loc_func
+
+    @memoized
+    def get_extern_func(self):
+        ext_func = os.popen('nm --format="posix" %s 2> /dev/null | grep " U " | cut -f 1 -d " "' % self.getfile()).read()
+        ext_func = [x.strip() for x in ext_func.strip().split('\n')]
+        return ext_func
+
+    def get_current_func(self):
+        func = gdb.selected_frame().name()
+        return '' if func == None else func
+
 ###########################################################################
 class PEDACmd(object):
+
     """
     Class for PEDA commands that interact with GDB
     """
@@ -5993,6 +6026,271 @@ class PEDACmd(object):
         return
     utils.options = ["int2hexstr", "list2hexstr", "str2intlist"]
 
+    #######################################################################
+
+    # def syminitatentry(self, *arg):
+    #     """
+    #     Symbolic Engine: run the executable, initiate triton engine and stop at entry point
+    #     Usage:
+    #         MYNAME <program_arguments>
+    #     """
+    #     entry = peda.elfentry()
+    #     if not entry:
+    #         error_msg("Entry point not known")
+    #         return
+    #     peda.execute("tbreak *%s" % entry)
+    #     peda.execute("run %s" % ' '.join(arg))
+    #     self.syminit()
+
+    def syminit(self, *arg):
+        """
+        Symbolic Engine: initialisation
+        Usage:
+            MYNAME
+        """
+
+        global cache
+        global trida
+        cache = []
+        trida = Trida()
+
+        # msg(peda.get_current_func())
+        # msg(peda.get_local_func())
+
+        try:
+            trida.regs = peda.getregs()
+            trida.reset()
+        except:
+            error_msg("You should run the executable before initiating trida")
+        return
+
+    def symuntil(self, *arg):
+        """
+        Symbolic Engine: Continue until given address or symbolized jump, whichever comes first.
+        Usage:
+            MYNAME hex_addr
+        """
+        # Assuming hex address is given
+        # target = p.r2p.integer(a[0])
+        try:
+            target = int(arg[0], 16)
+        except:
+            error_msg("Invalid argument, address should be a hexadecimal string")
+            return
+        addr = trida.symulate(stop=target)
+        # if addr != target:
+        #     warning_msg("Can not reach target, current address {:#x}".format(addr))
+        self.xuntil(addr)
+
+    def symuntiljump(self, *arg):
+        """
+        Symbolic Engine: Continue until symbolized jump
+        Usage:
+            MYNAME
+            MYNAME noextern
+        """
+        (noextern, ) = normalize_argv(arg, 1)
+        noextern = False if noextern == None else True
+        addr = trida.symulate(stop_on_sj=True, no_extern=noextern)
+        self.xuntil(addr)
+
+    def symuntilinst(self, *arg):
+        """
+        Symbolic Engine: Continue until symbolized instruction
+        Usage:
+            MYNAME
+            MYNAME noextern
+        """
+        (noextern, ) = normalize_argv(arg, 1)
+        noextern = False if noextern == None else True
+        addr = trida.symulate(stop_on_si=True, no_extern=noextern)
+        self.xuntil(addr)
+
+    def _restoreRerun(self, target):
+        trida.reset()
+        num_target = trida._jump_counter(target)
+        for inst in trida.inst_iter():
+            if inst.getAddress() == target:
+                if num_target == 0:
+                    self.goto(target)
+                    trida._jump_counter(target, increment=True)
+                    return True
+                num_target -= 1
+        return False
+
+    def symtake(self, *arg):
+        """
+        Symbolic Engine: Take current jump
+        Usage:
+            MYNAME
+        """
+        addr = peda.getreg("pc")
+        inst = trida.disassemble_inst(addr)
+        if not trida.is_conditional(inst):
+            error_msg("Invalid instruction type")
+            return
+        target = inst.getFirstOperand().getValue()
+
+        cstr = trida.build_jmp_constraint(pc=addr)
+        if not trida.process_constraint(cstr):
+            error_msg("Could not resolve constraint")
+            return
+
+        # reset and execute intil target is reached
+        if not self._restoreRerun(target):
+            error_msg("End of execution")
+
+    def symavoid(self, *arg):
+        """
+        Symbolic Engine: Avoid current jump
+        Usage:
+            MYNAME
+        """
+        addr = peda.getreg("pc")
+        inst = trida.disassemble_inst(addr)
+        if not trida.is_conditional(inst):
+            error_msg("Invalid instruction type")
+            return
+        target = inst.getAddress() + inst.getSize()
+
+        cstr = trida.build_jmp_constraint(pc=addr, take=False)
+        if not trida.process_constraint(cstr):
+            error_msg("Could not resolve constraint")
+            return
+
+        # reset and execute intil target is reached
+        if not self._restoreRerun(target):
+            error_msg("End of execution")
+
+    def syminput(self, *arg):
+        """
+        Symbolic Engine: Symbolize given memory
+        Usage:
+            MYNAME size hex_addr
+        """
+        if not len(arg):
+            for addr in trida.inputs:
+                b = chr(trida.peek(addr, 1))
+                if b in string.printable:
+                    msg("{:#x}: {:#x} ({})".format(addr, trida.peek(addr, 1), b))
+                else:
+                    msg("{:#x}: {:#x}".format(addr, trida.peek(addr, 1)))
+            return
+        elif len(arg) != 2:
+            error_msg("Command takes exactly 2 arguments")
+            return
+
+        try:
+            size = int(arg[0])
+            addr = int(arg[1], 16)
+        except:
+            error_msg("Invalid arguments, size should be a decimal number, address should be a hexadecimal number")
+            return
+
+        trida.add_input(addr, size)
+
+    def _get_byte(self, address):
+        for m in cache:
+            if m["start"] <= address < m["start"] + len(m["data"]):
+                idx = address - m["start"]
+                return struct.pack("B", m["data"][idx])
+
+    def symsync(self, *arg):
+        """
+        Symbolic Engine: Sync gdb with triton current state
+        Usage:
+            MYNAME
+        """
+        for address in trida.inputs:
+            peda.writemem(address, self._get_byte(address))
+
+    def symreset(self, *arg):
+        """
+        Symbolic Engine: Reset triton memory with gdb current state
+        Usage:
+            MYNAME
+        """
+        global cache
+        ncache = []
+        for m in cache:
+            addr = m["start"]
+            size = len(m["data"])
+            data = bytearray(peda.readmem(addr, size))
+            trida.write_mem(addr, data)
+            ncache.append({"start": addr, "data": data})
+        cache = ncache
+
+    def sympeek(self, *arg):
+        """
+        Symbolic Engine: Peek data at memory of given size
+        Usage:
+            MYNAME size hex_addr
+        """
+        try:
+            size = int(arg[0])
+            addr = int(arg[1], 16)
+        except:
+            error_msg("Invalid arguments, size should be a decimal number, address should be a hexadecimal number")
+            return
+
+        msg("{:#x}".format(trida.peek(addr, size)))
+
+    def sympoke(self, *arg):
+        """
+        Symbolic Engine: Store value at memory of given size
+        Usage:
+            MYNAME value size hex_addr
+        """
+        try:
+            value = arg[0]
+            if value.startswith("0x"):
+                value = int(value, 16)
+            else:
+                value = int(value)
+            size = int(arg[1])
+            addr = int(arg[2], 16)
+        except:
+            error_msg("Invalid arguments, size should be a decimal number, address should be a hexadecimal number")
+            return
+
+        trida.poke(addr, size, value)
+
+    def symsnapshot(self, *arg):
+        """
+        Symbolic Engine: Save/restore snapshots synced with symbolic execution engine
+        Usage:
+            MYNAME save file
+            MYNAME restore file
+        """
+        options = self.snapshot.__func__.options
+        (opt, filename) = normalize_argv(arg, 2)
+        if opt not in options:
+            self._missing_argument()
+
+        if not filename:
+            filename = peda.get_config_filename("snapshot")
+
+        if opt == "save":
+            self.symsync()
+            if peda.save_snapshot(filename, isSym=True):
+                msg("Saved process's snapshot to filename '%s'" % filename)
+            else:
+                error_msg("Failed to save process's snapshot")
+
+        if opt == "restore":
+            if peda.restore_snapshot(filename, isSym=True):
+                target = peda.getreg("pc")
+                if self._restoreRerun(target):
+                    msg("Restored process's snapshot from filename '%s'" % filename)
+                else:
+                    error_msg("Something crazy happened. Unable to restore snapshot.")
+                peda.execute("stop")
+            else:
+                error_msg("Failed to restore process's snapshot")
+
+        return
+
+
 ###########################################################################
 class pedaGDBCommand(gdb.Command):
     """
@@ -6085,6 +6383,276 @@ class Alias(gdb.Command):
                 completion = list(config.OPTIONS.keys())
         return completion
 
+
+###########################################################################
+class Trida(object):
+    CMD_HANDLED = 1
+    CMD_NOT_HANDLED = 0
+    def __init__(self, context=None):
+        self.comments = {}
+        self.arch = None
+        self.bits = 32
+        self.inputs = collections.OrderedDict()
+        self.regs = {}
+        self.triton_regs = {}
+        self.commands = {}
+        self.has_taken = {}
+
+        tritonarch = {
+            "x86": {
+                32: triton.ARCH.X86,
+                64: triton.ARCH.X86_64
+            },
+            "elf64-x86-64": {
+                32: triton.ARCH.X86,
+                64: triton.ARCH.X86_64
+            }
+
+        }
+        arch, bits = peda.getarch()
+        self.arch = tritonarch[arch][bits]
+
+        triton.setArchitecture(self.arch)
+        triton.setAstRepresentationMode(triton.AST_REPRESENTATION.PYTHON)
+
+
+        # Hack in order to be able to get triton register ids by name
+        for r in triton.getAllRegisters():
+            self.triton_regs[r.getName()] = r
+
+        if self.arch == triton.ARCH.X86:
+            self.pcreg = triton.REG.EIP
+        elif self.arch == triton.ARCH.X86_64:
+            self.pcreg = triton.REG.RIP
+        else:
+            raise(ValueError("Architecture not implemented"))
+
+        # See what to do about setattr
+        setattr(self.memoryCaching, "memsolver", peda)
+
+    def _jump_counter(self, target, increment=False):
+        if increment:
+            self.has_taken[target] = self.has_taken.get(target, 0) + 1
+            pass
+        return self.has_taken.get(target, 0)
+
+    def handle(self, command, args):
+        if command in self.commands:
+            return self.commands[command](self, args)
+        msg("[!] Unknown command {}".format(command))
+
+    def reset(self):
+        triton.resetEngines()
+        triton.clearPathConstraints()
+        triton.setArchitecture(self.arch)
+
+        triton.enableMode(triton.MODE.ALIGNED_MEMORY, True)
+        triton.enableMode(triton.MODE.ONLY_ON_SYMBOLIZED, True)
+
+        triton.addCallback(self.memoryCaching,
+                           triton.CALLBACK.GET_CONCRETE_MEMORY_VALUE)
+        triton.addCallback(self.constantFolding,
+                           triton.CALLBACK.SYMBOLIC_SIMPLIFICATION)
+
+        for r in self.regs:
+            if r in self.triton_regs:
+                triton.setConcreteRegisterValue(
+                    triton.Register(self.triton_regs[r], self.regs[r] & ((1 << self.triton_regs[r].getBitSize()) - 1))
+                )
+
+        for m in cache:
+            self.write_mem(m['start'], m["data"])
+
+        for address in self.inputs:
+                self.inputs[address] = triton.convertMemoryToSymbolicVariable(
+                    triton.MemoryAccess(
+                        address,
+                        triton.CPUSIZE.BYTE
+                    )
+                )
+
+    # Triton does not handle class method callbacks, use staticmethod.
+    @staticmethod
+    def memoryCaching(mem):
+        addr = mem.getAddress()
+        size = mem.getSize()
+        mapped = triton.isMemoryMapped(addr)
+        if not mapped:
+            dump = trida.memoryCaching.memsolver.read_mem(addr, size)
+            triton.setConcreteMemoryAreaValue(addr, bytearray(dump))
+            cache.append({"start": addr, "data": bytearray(dump)})
+        return
+
+    @staticmethod
+    def constantFolding(node):
+        if node.isSymbolized():
+            return node
+        return triton.ast.bv(node.evaluate(), node.getBitvectorSize())
+
+    def get_current_pc(self):
+        return triton.getConcreteRegisterValue(self.pcreg)
+
+    def disassemble_inst(self, pc=None):
+        _pc = self.get_current_pc()
+        if pc:
+            _pc = pc
+
+        opcodes = self.read_mem(_pc, 16)
+
+        # Create the Triton instruction
+        inst = triton.Instruction()
+        inst.setOpcodes(opcodes)
+        inst.setAddress(_pc)
+        # disassemble instruction
+        triton.disassembly(inst)
+        return inst
+
+    def inst_iter(self, pc=None):
+        while True:
+            inst = self.process_inst()
+            if inst.getType() == triton.OPCODE.HLT:
+                break
+            yield inst
+
+    def process_inst(self, pc=None):
+        _pc = self.get_current_pc()
+        if pc:
+            _pc = pc
+
+        # msg("{:#x}".format(_pc))
+        opcodes = self.read_mem(_pc, 16)
+
+        # Create the Triton instruction
+        inst = triton.Instruction()
+        inst.setOpcodes(opcodes)
+        inst.setAddress(_pc)
+        # execute instruction
+        triton.processing(inst)
+        return inst
+
+    def add_input(self, addr, size):
+        for offset in xrange(size):
+            self.inputs[addr + offset] = triton.convertMemoryToSymbolicVariable(
+                triton.MemoryAccess(
+                    addr + offset,
+                    triton.CPUSIZE.BYTE
+                )
+            )
+
+    def is_conditional(self, inst):
+        return inst.getType() in (triton.OPCODE.JAE, triton.OPCODE.JA, triton.OPCODE.JBE, triton.OPCODE.JB, triton.OPCODE.JCXZ, triton.OPCODE.JECXZ, triton.OPCODE.JE, triton.OPCODE.JGE, triton.OPCODE.JG, triton.OPCODE.JLE, triton.OPCODE.JL, triton.OPCODE.JNE, triton.OPCODE.JNO, triton.OPCODE.JNP, triton.OPCODE.JNS, triton.OPCODE.JO, triton.OPCODE.JP, triton.OPCODE.JS)
+
+    def symulate(self, stop=None, stop_on_sj=False, stop_on_si=False, no_extern=False):
+        if no_extern:
+            text_section = peda.elfheader()['.text']
+        while True:
+            inst = self.disassemble_inst()
+            addr = inst.getAddress()
+            if addr == stop or inst.getType() == triton.OPCODE.HLT:
+                return addr
+
+            inst = self.process_inst()
+            isSymbolized = inst.isSymbolized()
+            if isSymbolized:
+                for access, ast in inst.getLoadAccess():
+                    if(access.getAddress() in self.inputs):
+                        self.comments[addr] = "symbolized memory: {:#x}".format(access.getAddress())
+                rr = inst.getReadRegisters()
+                if rr:
+                    reglist = []
+                    for r, ast in rr:
+                        if ast.isSymbolized():
+                            reglist.append(r.getName())
+                    self.comments[addr] = "symbolized regs: {}".format(", ".join(reglist))
+
+            if stop_on_si == True and isSymbolized and (not no_extern or (addr >= text_section[0] and addr <= text_section[1])):
+                return addr
+
+            if (stop_on_sj == True and isSymbolized and inst.isControlFlow() and (inst.getType() != triton.OPCODE.JMP) and
+                    (not no_extern or (addr >= text_section[0] and addr <= text_section[1]))):
+                return addr
+
+
+    def process_constraint(self, cstr):
+        global cache
+        # request a model verifying cstr
+        model = triton.getModel(cstr)
+        if not model:
+            return False
+
+        # apply model to memory cache
+        for m in model:
+            for address in self.inputs:
+                if model[m].getId() == self.inputs[address].getId():
+                    nCache = []
+                    for c in cache:
+                        if c["start"] <= address < c["start"] + len(c["data"]):
+                            c["data"][address-c["start"]] = model[m].getValue()
+                        nCache.append(c)
+                    cache = nCache
+
+        return True
+
+    def build_jmp_constraint(self, pc=None, take=True):
+        _pc = self.get_current_pc()
+        if pc:
+            _pc = pc
+
+        inst = self.disassemble_inst(_pc)
+        if take:
+            target = inst.getFirstOperand().getValue()
+        else:
+            target = _pc + inst.getSize()
+
+        pco = triton.getPathConstraints()
+        cstr = triton.ast.equal(triton.ast.bvtrue(), triton.ast.bvtrue())
+
+        for pc in pco:
+            if pc.isMultipleBranches():
+                branches = pc.getBranchConstraints()
+                for branch in branches:
+
+                    taken = branch["isTaken"]
+                    src = branch["srcAddr"]
+                    dst = branch["dstAddr"]
+                    bcstr = branch["constraint"]
+
+                    isPreviousBranchConstraint = (src != _pc) and taken
+                    isBranchToTake =  src == _pc and dst == target
+
+                    if isPreviousBranchConstraint or isBranchToTake:
+                        cstr = triton.ast.land(cstr, bcstr)
+
+        cstr = triton.ast.assert_(cstr)
+        return cstr
+
+    def peek(self, addr, size):
+        return triton.getConcreteMemoryValue(triton.MemoryAccess(addr, size))
+
+    def poke(self, addr, size, value):
+        return triton.setConcreteMemoryValue(triton.MemoryAccess(addr, size, value))
+
+    def read_mem(self, addr, size):
+        return triton.getConcreteMemoryAreaValue(addr, size)
+
+    def write_mem(self, addr, data):
+        triton.setConcreteMemoryAreaValue(addr, data)
+
+    def read_str(self, addr):
+        s = str()
+        i = 0
+        while (True):
+            v = self.peek(addr + i, 1)
+            s += chr(v)
+            if not v: break
+        return s
+
+    @staticmethod
+    def isMapped(addr):
+        for m in cache:
+            if m["start"] <= addr < m["start"] + len(m["data"]):
+                return True
+        return False
 
 ###########################################################################
 ## INITIALIZATION ##

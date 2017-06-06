@@ -27,6 +27,24 @@ PEDA - Python Exploit Development Assistance for GDB
   * `vmmap` -- Get virtual mapping address ranges of section(s) in debugged process
   * `xormem` -- XOR a memory region with a key
 
+## Symbolic Execution Features:
+* Run triton engine parallel to GDB to visual the execution of a program while it is run over the symbolic engine.
+  * `syminit` Initiate triton symbolic engine and its linkage with GDB
+  * `syminput` Add symbolic input variables
+  * `symuntil` Execute instructions until a given address
+  * `symuntiljump` Execute instructions until a symbolized jump instruction is encountered
+  * `symuntilinst` Execute instructions until a symbolized instruction is encountered
+  * `symtake` Take symbolized jump
+  * `symavoid` Avoid symbolized jump
+  * `symsync` Sync GDB with Triton current state
+  * `symreset` Reset triton memory with GDB current state
+  * `symsnapshot` Save/restore snapshot of Triton+GDB memory state
+  * `sympeek` Check memory content in Triton engine
+  * `sympoke` Change memory content in Triton engine
+
+* An illustration can be found here:
+ [![asciicast](https://asciinema.org/a/FQ0rj7zhMNS8ZDnwwnoCz9NFX.png)](https://asciinema.org/a/FQ0rj7zhMNS8ZDnwwnoCz9NFX?speed=1.25)
+
 ## Installation
 
     git clone https://github.com/longld/peda.git ~/peda
