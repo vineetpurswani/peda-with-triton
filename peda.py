@@ -6166,9 +6166,12 @@ class PEDACmd(object):
         """
         Symbolic Engine: Symbolize given memory
         Usage:
-            MYNAME size hex_addr
+            MYNAME <size> <hex_addr>
+            MYNAME <size> <hex_addr> printable
         """
-        if not len(arg):
+        (size, addr, printable, ) = normalize_argv(arg, 3)
+        
+        if not size:
             for addr in trida.inputs:
                 b = chr(trida.peek(addr, 1))
                 if b in string.printable:
@@ -6176,18 +6179,15 @@ class PEDACmd(object):
                 else:
                     msg("{:#x}: {:#x}".format(addr, trida.peek(addr, 1)))
             return
-        elif len(arg) != 2:
-            error_msg("Command takes exactly 2 arguments")
-            return
+        elif not addr:
+            self._missing_argument()
 
-        try:
-            size = int(arg[0])
-            addr = int(arg[1], 16)
-        except:
+        if not (type(size) is int and type(addr) is int):
             error_msg("Invalid arguments, size should be a decimal number, address should be a hexadecimal number")
-            return
-
-        trida.add_input(addr, size)
+            Exception("invalid arguments")
+        
+        printable = False if printable is None else True
+        trida.add_input(addr, size, printable)
 
     def _get_byte(self, address):
         for m in cache:
@@ -6397,6 +6397,7 @@ class Trida(object):
         self.triton_regs = {}
         self.commands = {}
         self.has_taken = {}
+        self.sv_cstrs = []
 
         tritonarch = {
             "x86": {
@@ -6530,7 +6531,7 @@ class Trida(object):
         triton.processing(inst)
         return inst
 
-    def add_input(self, addr, size):
+    def add_input(self, addr, size, printable=False):
         for offset in xrange(size):
             self.inputs[addr + offset] = triton.convertMemoryToSymbolicVariable(
                 triton.MemoryAccess(
@@ -6538,6 +6539,9 @@ class Trida(object):
                     triton.CPUSIZE.BYTE
                 )
             )
+            
+            if printable:
+                self.sv_cstrs.append(addr+offset)
 
     def is_conditional(self, inst):
         return inst.getType() in (triton.OPCODE.JAE, triton.OPCODE.JA, triton.OPCODE.JBE, triton.OPCODE.JB, triton.OPCODE.JCXZ, triton.OPCODE.JECXZ, triton.OPCODE.JE, triton.OPCODE.JGE, triton.OPCODE.JG, triton.OPCODE.JLE, triton.OPCODE.JL, triton.OPCODE.JNE, triton.OPCODE.JNO, triton.OPCODE.JNP, triton.OPCODE.JNS, triton.OPCODE.JO, triton.OPCODE.JP, triton.OPCODE.JS)
@@ -6623,8 +6627,55 @@ class Trida(object):
                     if isPreviousBranchConstraint or isBranchToTake:
                         cstr = triton.ast.land(cstr, bcstr)
 
+        # Accurate but slow
+        # triton.setAstRepresentationMode(triton.AST_REPRESENTATION.SMT)
+        # sv_involved = self._add_svcstr(triton.getFullAst(cstr))
+        # triton.setAstRepresentationMode(triton.AST_REPRESENTATION.PYTHON)
+        # for sv_addr in sv_involved:
+        #     sv = triton.ast.variable(self.inputs[sv_addr])
+        #     cstr = triton.ast.land(cstr, \
+        #             triton.ast.land(triton.ast.bvuge(sv, triton.ast.bv(0x20,  8)), \
+        #                             triton.ast.bvule(sv, triton.ast.bv(0x7E,  8))
+        #                             )
+        #             )
+        
+        # Not performing well either -- problem is too many constraints
+        # triton.setAstRepresentationMode(triton.AST_REPRESENTATION.SMT)
+        # copy_cstr = str(triton.getFullAst(cstr))
+        # triton.setAstRepresentationMode(triton.AST_REPRESENTATION.PYTHON)
+        # for sv_addr in self.sv_cstrs:
+        #     sv = triton.ast.variable(self.inputs[sv_addr])
+        #     if copy_cstr.find(str(sv)) != -1:
+        #         cstr = triton.ast.land(cstr, \
+        #                 triton.ast.land(triton.ast.bvuge(sv, triton.ast.bv(0x20,  8)), \
+        #                                 triton.ast.bvule(sv, triton.ast.bv(0x7E,  8))
+        #                                 )
+        #                 )
+
+        for sv_addr in self.sv_cstrs:
+            sv = triton.ast.variable(self.inputs[sv_addr])
+            cstr = triton.ast.land(cstr, \
+                    triton.ast.land(triton.ast.bvuge(sv, triton.ast.bv(0x20,  8)), \
+                                    triton.ast.bvule(sv, triton.ast.bv(0x7E,  8))
+                                    )
+                    )
+
         cstr = triton.ast.assert_(cstr)
         return cstr
+
+    def _add_svcstr(self, cstr):
+        res = set()
+        if cstr is not None and cstr.isSymbolized():
+            if cstr.getKind() == triton.AST_NODE.VARIABLE:
+                for sv_addr in self.sv_cstrs:
+                    sv = self.inputs[sv_addr]
+                    if str(cstr) == sv.getName():
+                        res.add(sv_addr)
+                        break
+            else:
+                for child_cstr in cstr.getChilds():
+                    res.update(self._add_svcstr(child_cstr))
+        return res
 
     def peek(self, addr, size):
         return triton.getConcreteMemoryValue(triton.MemoryAccess(addr, size))
